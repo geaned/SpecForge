@@ -25,12 +25,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.cache_utils import DynamicCache
 
-from specforge.core.loss import LogSoftmaxLoss
-from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
+
+from .draft import Eagle3DraftModel
+from .loss import LogSoftmaxLoss
 
 
 class Eagle3Model(nn.Module):
@@ -273,7 +273,7 @@ class OfflineEagle3Model(OnlineEagle3Model):
         return super().forward(
             input_ids,
             attention_mask,
-            loss_mask,
+            loss_mask.unsqueeze(-1),
             past_key_values,
             position_ids,
             **kwargs,

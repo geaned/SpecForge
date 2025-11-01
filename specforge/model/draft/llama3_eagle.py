@@ -960,10 +960,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            print_with_rank("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()

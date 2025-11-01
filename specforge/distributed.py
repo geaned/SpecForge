@@ -6,20 +6,32 @@ import torch.distributed as dist
 from specforge.utils import print_with_rank
 
 _DEVICE_MESH = None
-_TP_DEVICE_MESH = None
-_TP_GROUP = None
-_DP_DEVICE_MESH = None
-_DP_GROUP = None
+_TARGET_TP_DEVICE_MESH = None
+_DRAFT_DP_DEVICE_MESH = None
+_TARGET_TP_GROUP = None
+_TARGET_DP_GROUP = None
+_DRAFT_TP_GROUP = None
+_DRAFT_DP_GROUP = None
 
 
-def get_tp_group():
-    global _TP_GROUP
-    return _TP_GROUP
+def get_target_tp_group():
+    global _TARGET_TP_GROUP
+    return _TARGET_TP_GROUP
 
 
-def get_dp_group():
-    global _DP_GROUP
-    return _DP_GROUP
+def get_target_dp_group():
+    global _TARGET_DP_GROUP
+    return _TARGET_DP_GROUP
+
+
+def get_draft_tp_group():
+    global _DRAFT_TP_GROUP
+    return _DRAFT_TP_GROUP
+
+
+def get_draft_dp_group():
+    global _DRAFT_DP_GROUP
+    return _DRAFT_DP_GROUP
 
 
 def get_device_mesh():
@@ -27,17 +39,19 @@ def get_device_mesh():
     return _DEVICE_MESH
 
 
-def get_tp_device_mesh():
-    global _TP_DEVICE_MESH
-    return _TP_DEVICE_MESH
+def get_target_tp_device_mesh():
+    global _TARGET_TP_DEVICE_MESH
+    return _TARGET_TP_DEVICE_MESH
 
 
-def get_dp_device_mesh():
-    global _DP_DEVICE_MESH
-    return _DP_DEVICE_MESH
+def get_draft_dp_device_mesh():
+    global _DRAFT_DP_DEVICE_MESH
+    return _DRAFT_DP_DEVICE_MESH
 
 
-def init_distributed(timeout: int = 10, tp_size: int = 1):
+def init_distributed(
+    timeout: int = 10, target_tp_size: int = 1, draft_tp_size: int = 1
+):
     """Initialize distributed training.
 
     Args:

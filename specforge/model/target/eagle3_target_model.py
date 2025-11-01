@@ -20,6 +20,7 @@ from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
 from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
+from .target_head import TargetHead
 
 
 @dataclass
@@ -172,6 +173,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     def __init__(self, model_runner: SGLangRunner):
         super().__init__()
         self.model_runner = model_runner
+        self.target_head = None
 
     @classmethod
     def from_pretrained(
@@ -363,6 +365,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         **kwargs,
     ) -> "CustomEagle3TargetModel":
         from specforge.modeling.auto import AutoDistributedTargetModel
+
         target_model = AutoDistributedTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
@@ -379,16 +382,25 @@ def get_eagle3_target_model(
     torch_dtype: torch.dtype = None,
     device: str = None,
     cache_dir: Optional[str] = None,
+    lm_head_key: str = "lm_head.weight",
     **kwargs,
 ) -> Eagle3TargetModel:
     if backend == "sglang":
-        return SGLangEagle3TargetModel.from_pretrained(
+        target_head = TargetHead(pretrained_model_name_or_path)
+        target_head.load_weights(
+            model_path=pretrained_model_name_or_path, lm_head_key=lm_head_key
+        )
+        target_head.freeze_weights()
+        target_head = target_head.eval().cuda().to(torch_dtype)
+        target_model = SGLangEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
             device=device,
             cache_dir=cache_dir,
             **kwargs,
         )
+        target_model.target_head = target_head
+        return target_model
     elif backend == "hf":
         return HFEagle3TargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
