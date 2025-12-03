@@ -134,9 +134,14 @@ class OnlineEagle3Model(Eagle3Model):
         hidden_states = torch.cat(
             (hidden_states0, hidden_states1, hidden_states2), dim=-1
         )
+        # hidden_states = _uniform_augment(hidden_states)
 
         # apply pading
         target = outputs.logits
+        # target = torch.nn.functional.one_hot(
+        #     padding(input_ids, left=False),
+        #     num_classes=outputs.logits.shape[-1]
+        # )  # one-hot training
         target = padding(target, left=False)
         input_ids = padding(input_ids, left=False)
 
@@ -144,8 +149,12 @@ class OnlineEagle3Model(Eagle3Model):
             target = target.to(device)
             loss_mask = loss_mask[..., None]
             loss_mask = loss_mask.to(device)
+            loss_mask = padding(loss_mask, left=False)
 
         return hidden_states, target, loss_mask, input_ids
+
+    def _uniform_augment(t: torch.Tensor, r: float = 0.1) -> torch.Tensor:
+        return t + torch.empty_like(t).uniform_(-r, r)
 
     def forward(
         self,
@@ -268,7 +277,8 @@ class OnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            # loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            loss = _compute_loss(logits, target_p, position_mask)  # used for draft_vocab_size > 65536
             plosses.append(loss)
 
             if not is_last:
@@ -655,6 +665,15 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         return plosses, vlosses, acces
 
 
+@torch.compile(dynamic=None)
+def _compute_loss(logits, target_p, position_mask):
+    logits = logits.float()
+    out_logp = nn.LogSoftmax(dim=2)(logits)
+    plogp = target_p * out_logp
+    loss = -torch.sum(position_mask * plogp, 2).mean()
+    return loss
+
+
 def _compute_target_p_padded(target, t2d, loss_mask, length):
     with torch.no_grad():
         target_p, position_mask = _compute_target_p(
@@ -685,6 +704,7 @@ def _compute_target_p(target, t2d, loss_mask):
     target_head = target_head[..., t2d]
     target_head = target_head.float()
     target_p = nn.Softmax(dim=2)(target_head)
+    # target_p = target_head  # used during one-hot training
     target_p = target_p.detach()
     return target_p, position_mask
 

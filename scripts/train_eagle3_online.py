@@ -21,11 +21,7 @@ from specforge import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
-from specforge.data import (
-    build_eagle3_dataset,
-    generate_vocab_mapping_file,
-    prepare_dp_dataloaders,
-)
+from specforge.data import prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
@@ -41,6 +37,36 @@ from specforge.utils import (
     print_with_rank,
     rank_0_priority,
 )
+
+
+def save_model(model, optimizer_state, output_dir):
+    # Save the model
+    if dist.get_rank() == 0:
+        os.makedirs(output_dir, exist_ok=True)
+    dist.barrier()
+
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+        model_state_dict = model.state_dict()
+        draft_model_state_dict = {
+            k.replace("draft_model.", ""): v
+            for k, v in model_state_dict.items()
+            if "draft_model." in k and "embed" not in k.lower()
+        }
+
+        if dist.get_rank() == 0:
+            torch.save(
+                optimizer_state,
+                os.path.join(output_dir, "training_state.pt"),
+            )
+            print_on_rank0(
+                f"Saved full training state to {output_dir}/training_state.pt"
+            )
+            model.draft_model.save_pretrained(
+                output_dir,
+                state_dict=draft_model_state_dict,
+            )
+            print_on_rank0(f"Saved model configuration to {output_dir}")
+        dist.barrier()
 
 
 def parse_args():
@@ -114,6 +140,9 @@ def parse_args():
     parser.add_argument("--cache-dir", type=str, default="./cache")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--eval-interval", type=int, default=1)
+    parser.add_argument(
+        "--save-strategy", type=str, default="epochs", choices=["epochs", "steps"]
+    )
     parser.add_argument("--save-interval", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -191,6 +220,8 @@ def parse_args():
     parser.add_argument("--profile-start-step", type=int, default=30)
     parser.add_argument("--profile-num-steps", type=int, default=4)
     parser.add_argument("--profile-record-shapes", action="store_true")
+    parser.add_argument("--profile-memory", action="store_true")
+    parser.add_argument("--profile-memory-steps", type=int, default=8)
 
     args = parser.parse_args()
 
@@ -201,6 +232,8 @@ def main():
     # initialize
     parser, args = parse_args()
     set_seed(args.seed)
+    if os.environ.get("SGLANG_TORCH_PROFILER_DIR", "") and args.profile_memory:
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed environment")
     args.dp_size = dist.get_world_size() // args.tp_size
@@ -325,7 +358,27 @@ def main():
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    custom_preprocessing = "custom" in args.chat_template
+    if custom_preprocessing:
+        print_on_rank0("Using custom preprocessing implementation")
+        from specforge.data.preprocessing_custom import (
+            build_eagle3_dataset,
+            generate_vocab_mapping_file
+        )
+        vocab_kwargs = {"num_proc": args.build_dataset_num_proc}
+    else:
+        print_on_rank0("Using base preprocessing implementation")
+        from specforge.data.preprocessing import (
+            build_eagle3_dataset,
+            generate_vocab_mapping_file
+        )
+        vocab_kwargs = {}
+
+    train_dataset = (
+        load_dataset("csv", data_files=args.train_data_path, delimiter="\t")["train"]
+        if custom_preprocessing else
+        load_dataset("json", data_files=args.train_data_path)["train"]
+    )
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -345,6 +398,7 @@ def main():
             draft_vocab_size=draft_model_config.draft_vocab_size,
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
+            **vocab_kwargs
         )
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
@@ -373,7 +427,11 @@ def main():
     print_with_rank("Loaded vocab mapping")
 
     if args.eval_data_path is not None:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
+        eval_dataset = (
+            load_dataset("csv", data_files=args.eval_data_path, delimiter="\t")["train"]
+            if custom_preprocessing else
+            load_dataset("json", data_files=args.eval_data_path)["train"]
+        )
         eval_eagle3_dataset = build_eagle3_dataset(
             eval_dataset,
             tokenizer,
@@ -499,6 +557,12 @@ def main():
                     print(f"End profile {output_path=}")
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
+            if args.profile_memory and batch_index == args.profile_memory_steps:
+                torch.cuda.memory._dump_snapshot(os.path.join(
+                    os.environ["SGLANG_TORCH_PROFILER_DIR"],
+                    f"memory_rank{torch.distributed.get_rank()}_{time.time()}.pkl"
+                ))
+                torch.cuda.memory._record_memory_history(enabled=None)
 
             if args.is_vlm:
                 plosses, _, acces = eagle3_model(
@@ -554,6 +618,20 @@ def main():
                 progress_bar.set_postfix(
                     {"loss": f"{avg_loss:.2f}", "acc": f"{avg_acc:.2f}"}
                 )
+
+            if (
+                args.save_strategy == "steps" and global_step and
+                (global_step % args.save_interval == 0 or global_step == args.total_steps)
+            ):
+                print_on_rank0(f"Saving model after step {global_step}")
+                state_to_save = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "args": args,
+                }
+                state_to_save.update(optimizer.state_dict())
+                output_dir = os.path.join(args.output_dir, f"step_{global_step}")
+                save_model(eagle3_model, state_to_save, output_dir)
 
         epoch_logdict = {}
         for i in range(len(epoch_acces)):
@@ -627,42 +705,19 @@ def main():
                 )
             tracker.log(eval_logdict, step=global_step)
 
+        if args.save_strategy != "epochs":
+            continue
+
         if epoch % args.save_interval == 0:
-            # Save the model
-            epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
-
-            if dist.get_rank() == 0:
-                os.makedirs(epoch_output_dir, exist_ok=True)
-            dist.barrier()
-
-            with FSDP.state_dict_type(eagle3_model, StateDictType.FULL_STATE_DICT):
-                model_state_dict = eagle3_model.state_dict()
-                state_to_save = {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "args": args,
-                }
-                state_to_save.update(optimizer.state_dict())
-                draft_model_state_dict = {
-                    k.replace("draft_model.", ""): v
-                    for k, v in model_state_dict.items()
-                    if "draft_model." in k and "embed" not in k.lower()
-                }
-
-                if dist.get_rank() == 0:
-                    torch.save(
-                        state_to_save,
-                        os.path.join(epoch_output_dir, "training_state.pt"),
-                    )
-                    print_on_rank0(
-                        f"Saved full training state to {epoch_output_dir}/training_state.pt"
-                    )
-                    draft_model.save_pretrained(
-                        epoch_output_dir,
-                        state_dict=draft_model_state_dict,
-                    )
-                    print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
-                dist.barrier()
+            print_on_rank0(f"Saving model after epoch {epoch}")
+            state_to_save = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "args": args,
+            }
+            state_to_save.update(optimizer.state_dict())
+            output_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
+            save_model(eagle3_model, state_to_save, output_dir)
 
     # Close the tracker
     tracker.close()

@@ -10,6 +10,7 @@ import torch.distributed as dist
 from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 @contextmanager
