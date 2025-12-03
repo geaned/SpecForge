@@ -23,7 +23,7 @@ TESTING = False
 def build_loss_mask(
     input_ids: torch.Tensor,
     start_seq: List[int],
-    end_seq: List[int]
+    end_seq: Optional[List[int]]
 ) -> torch.Tensor:
     """
     Builds a boolean mask where True marks tokens inside a conversation response.
@@ -46,18 +46,17 @@ def build_loss_mask(
 
     # Detect Sequence: The mask should turn ON at the token *after* the token sequence.
     # We pad len(seq) positions to the left (and 0 to right) to shift the trigger forward.
-    def get_triggers(input_ids: torch.Tensor, seq: List[int]):
+    def get_triggers(input_ids: torch.Tensor, seq: Optional[List[int]]):
+        if seq is None:
+            return torch.zeros_like(input_ids, dtype=torch.bool)
+
         triggers = torch.ones(len(input_ids) - len(seq), dtype=torch.bool)
         for idx, tok in enumerate(seq):
             end_idx = -len(seq)+idx
             triggers &= (input_ids[idx:end_idx] == tok)
 
         return torch.nonzero(
-            torch.nn.functional.pad(
-                triggers,
-                pad=(3, 0),
-                value=False
-            ),
+            torch.nn.functional.pad(triggers, pad=(len(seq), 0), value=False),
             as_tuple=True
         )[0]
 
@@ -66,9 +65,12 @@ def build_loss_mask(
     end_triggers = get_triggers(input_ids, end_seq)
 
     # 2. Match End Trigger Sequencez Whenever Possible
-    end_insertion_indices = torch.searchsorted(end_triggers, start_triggers)
-    valid_mask = end_insertion_indices < len(end_triggers)
-    matched_end_triggers = end_triggers[end_insertion_indices[valid_mask]]
+    if any(end_triggers):
+        end_insertion_indices = torch.searchsorted(end_triggers, start_triggers)
+        valid_mask = end_insertion_indices < len(end_triggers)
+        matched_end_triggers = end_triggers[end_insertion_indices[valid_mask]]
+    else:
+        matched_end_triggers = torch.zeros_like(input_ids, dtype=torch.bool)
 
     # 3. Update the Delta Tensor
     # Add +1 at start positions and subtract -1 at matched end positions
@@ -132,7 +134,7 @@ def preprocess_conversations(
                 max_length=max_length,
                 add_special_tokens=False,
                 return_tensors="pt"
-            ).input_ids
+            ).input_ids[0]
         else:
             conv_dict = json.loads(conv_str)
             tools_dict = json.loads(tools_str)
@@ -148,10 +150,13 @@ def preprocess_conversations(
                 max_length=max_length,
                 add_special_tokens=False,
                 return_tensors="pt"
-            ).input_ids
+            )[0]
 
         start_seq = tokenizer(chat_template_inst.assistant_header).input_ids
-        end_seq = tokenizer(chat_template_inst.end_of_turn_token).input_ids
+        end_seq = (
+            tokenizer(chat_template_inst.end_of_turn_token).input_ids
+            if chat_template_inst.end_of_turn_token else None
+        )
         loss_mask = build_loss_mask(input_ids, start_seq, end_seq)
 
         results["input_ids"].append(input_ids[None, :])
@@ -216,7 +221,7 @@ def build_eagle3_dataset(
                 )
             processed = preprocess_conversations(
                 tokenizer=tokenizer,
-                messages=examples["text"],
+                conversations=examples["text"],
                 tools=[list()]*len(examples["text"]),
                 chat_template=chat_template,
                 max_length=max_length,
@@ -230,7 +235,7 @@ def build_eagle3_dataset(
                 )
             processed = preprocess_conversations(
                 tokenizer=tokenizer,
-                messages=examples["messages"],
+                conversations=examples["messages"],
                 tools=examples["tools"],
                 chat_template=chat_template,
                 max_length=max_length,
@@ -240,9 +245,7 @@ def build_eagle3_dataset(
         return processed
 
     def filter_preprocessed(results):
-        print(results["loss_mask"].shape)
-        raise Exception()
-        return [(sum(mask[0]) > 0) for mask in results["loss_mask"]]
+        return (torch.tensor(results["loss_mask"]).squeeze(1).sum(dim=-1) > 0).tolist()
 
     # Process dataset only once
     if cache_dir and cache_key:
