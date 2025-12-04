@@ -26,9 +26,7 @@ from specforge import (
 )
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.data import (
-    build_eagle3_dataset,
     build_offline_eagle3_dataset,
-    generate_vocab_mapping_file,
     prepare_dp_dataloaders,
 )
 from specforge.distributed import (
@@ -198,6 +196,8 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     profiling_group.add_argument("--profile-start-step", type=int, default=30)
     profiling_group.add_argument("--profile-num-steps", type=int, default=4)
     profiling_group.add_argument("--profile-record-shapes", action="store_true")
+    profiling_group.add_argument("--profile-memory", action="store_true")
+    profiling_group.add_argument("--profile-memory-steps", type=int, default=8)
 
     # sglang target model backend related args
     sglang_group = parser.add_argument_group("sglang target model backend")
@@ -383,7 +383,27 @@ def build_dataloaders(
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    custom_preprocessing = "custom" in args.chat_template
+    if custom_preprocessing:
+        print_on_rank0("Using custom preprocessing implementation")
+        from specforge.data.preprocessing_custom import (
+            build_eagle3_dataset,
+            generate_vocab_mapping_file
+        )
+        vocab_kwargs = {"num_proc": args.build_dataset_num_proc}
+    else:
+        print_on_rank0("Using base preprocessing implementation")
+        from specforge.data.preprocessing import (
+            build_eagle3_dataset,
+            generate_vocab_mapping_file
+        )
+        vocab_kwargs = {}
+
+    train_dataset = (
+        load_dataset("csv", data_files=args.train_data_path, delimiter="\t")["train"]
+        if custom_preprocessing else
+        load_dataset("json", data_files=args.train_data_path)["train"]
+    )
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -403,6 +423,7 @@ def build_dataloaders(
             draft_vocab_size=draft_model_config.draft_vocab_size,
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
+            **vocab_kwargs
         )
 
         if args.train_hidden_states_path is not None:
@@ -617,6 +638,8 @@ def main():
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
+    if args.profile_memory:
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
 
     sanity_check(args)
     print_with_rank("Initialized distributed environment")
@@ -749,6 +772,12 @@ def main():
                     print(f"End profile {output_path=}")
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
+            if args.profile_memory and global_step == args.profile_memory_steps:
+                torch.cuda.memory._dump_snapshot(os.path.join(
+                    args.output_dir,
+                    f"memory_rank{torch.distributed.get_rank()}_{time.time()}.pkl"
+                ))
+                torch.cuda.memory._record_memory_history(enabled=None)
 
             # ================================================
             # 7.1 Training Step
@@ -826,6 +855,10 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
+
+    if global_step % args.save_interval != 0:
+        # Save the final checkpoint
+        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
     # Close the tracker
     tracker.close()

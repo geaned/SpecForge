@@ -29,7 +29,7 @@ from transformers.cache_utils import DynamicCache
 
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
-from specforge.utils import padding
+from specforge.utils import padding, print_on_rank0
 
 
 class Eagle3Model(nn.Module):
@@ -86,6 +86,10 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
         """
+        print_on_rank0(input_ids.shape)
+        print_on_rank0(attention_mask.shape)
+        print_on_rank0(loss_mask.shape)
+
         # Step 1: handle vocab size
         target_p_padded, position_mask = _compute_target_p_padded(
             target=target,
@@ -183,7 +187,8 @@ class OnlineEagle3Model(Eagle3Model):
                 )
 
             # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            # loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+            loss = _compute_loss(logits, target_p, position_mask)  # used for draft_vocab_size > 65536
             plosses.append(loss)
 
             if not is_last:
@@ -567,6 +572,15 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
+
+
+@torch.compile(dynamic=None)
+def _compute_loss(logits, target_p, position_mask):
+    logits = logits.float()
+    out_logp = nn.LogSoftmax(dim=2)(logits)
+    plogp = target_p * out_logp
+    loss = -torch.sum(position_mask * plogp, 2).mean()
+    return loss
 
 
 def _compute_target_p_padded(target, t2d, loss_mask, length):

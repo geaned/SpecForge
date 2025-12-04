@@ -194,6 +194,9 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 )
 
         try:
+            from specforge.utils import print_on_rank0
+            print_on_rank0(input_ids.shape)
+            print_on_rank0(attention_mask.shape)
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -222,12 +225,18 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         hidden_states = torch.cat(
             (hidden_states0, hidden_states1, hidden_states2), dim=-1
         )
+        # hidden_states = HFEagle3TargetModel._uniform_augment(hidden_states)
 
         # apply pading
         target = outputs.logits
+        # target = torch.nn.functional.one_hot(
+        #     padding(input_ids, left=False),
+        #     num_classes=outputs.logits.shape[-1]
+        # )  # one-hot training
         target = padding(target, left=False)
         input_ids = padding(input_ids, left=False)
         loss_mask = loss_mask[..., None].to(target.device)
+        loss_mask = padding(loss_mask, left=False)
 
         return Eagle3TargetOutput(
             hidden_states=hidden_states,
@@ -236,6 +245,10 @@ class HFEagle3TargetModel(Eagle3TargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
+
+    @staticmethod
+    def _uniform_augment(t: torch.Tensor, r: float = 0.1) -> torch.Tensor:
+        return t + torch.empty_like(t).uniform_(-r, r)
 
 
 class SGLangEagle3TargetModel(Eagle3TargetModel):

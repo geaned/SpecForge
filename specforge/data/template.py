@@ -187,6 +187,18 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+
+TEMPLATE_REGISTRY.register(
+    name="yagpt",
+    template=ChatTemplate(
+        assistant_header="[SEP]",  # the headers are not applicable to openai-harmony's channel tags
+        user_header=None,
+        system_prompt=None,
+        end_of_turn_token=None,
+    ),
+)
+
+
 TEMPLATE_REGISTRY.register(
     name="deepseek-r1-distill",
     template=ChatTemplate(
