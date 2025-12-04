@@ -29,7 +29,7 @@ from transformers.cache_utils import DynamicCache
 
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.modeling.draft import Eagle3DraftModel
-from specforge.utils import padding, print_on_rank0
+from specforge.utils import padding
 
 
 class Eagle3Model(nn.Module):
@@ -86,10 +86,6 @@ class OnlineEagle3Model(Eagle3Model):
             past_key_values: We dont use this past_key_values in eagle3, but keep it for compatibility. We control kvcache by cache_hidden.
             position_ids: (batch, seq_len)
         """
-        print_on_rank0(input_ids.shape)
-        print_on_rank0(attention_mask.shape)
-        print_on_rank0(loss_mask.shape)
-
         # Step 1: handle vocab size
         target_p_padded, position_mask = _compute_target_p_padded(
             target=target,

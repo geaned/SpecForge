@@ -194,9 +194,6 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 )
 
         try:
-            from specforge.utils import print_on_rank0
-            print_on_rank0(input_ids.shape)
-            print_on_rank0(attention_mask.shape)
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
