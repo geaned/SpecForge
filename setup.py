@@ -17,6 +17,8 @@ def read_version():
         return f.read().strip()
 
 
+# In order to use YT functionality, please run `pip install -r requirements_yt.txt`
+# beforehand to install required extra packages
 setup(
     name="specforge",
     packages=find_packages(exclude=["configs", "scripts", "tests"]),

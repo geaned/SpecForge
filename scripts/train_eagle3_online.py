@@ -21,7 +21,7 @@ from specforge import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
-from specforge.data import prepare_dp_dataloaders
+from specforge.data import generate_vocab_mapping_file, prepare_dp_dataloaders
 from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
@@ -39,7 +39,7 @@ from specforge.utils import (
 )
 
 
-def save_model(model, optimizer_state, output_dir):
+def save_model(model, state, output_dir):
     # Save the model
     if dist.get_rank() == 0:
         os.makedirs(output_dir, exist_ok=True)
@@ -55,7 +55,7 @@ def save_model(model, optimizer_state, output_dir):
 
         if dist.get_rank() == 0:
             torch.save(
-                optimizer_state,
+                state,
                 os.path.join(output_dir, "training_state.pt"),
             )
             print_on_rank0(
@@ -94,7 +94,7 @@ def parse_args():
     parser.add_argument("--train-data-path", type=str, required=True)
     parser.add_argument("--eval-data-path", type=str, default=None)
     parser.add_argument("--num-epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1, help="deprecated: use --draft-micro-batch-size")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--warmup-ratio", type=float, default=0.015)
@@ -361,18 +361,10 @@ def main():
     custom_preprocessing = "custom" in args.chat_template
     if custom_preprocessing:
         print_on_rank0("Using custom preprocessing implementation")
-        from specforge.data.preprocessing_custom import (
-            build_eagle3_dataset,
-            generate_vocab_mapping_file
-        )
-        vocab_kwargs = {"num_proc": args.build_dataset_num_proc}
+        from specforge.data.preprocessing_custom import build_eagle3_dataset
     else:
         print_on_rank0("Using base preprocessing implementation")
-        from specforge.data.preprocessing import (
-            build_eagle3_dataset,
-            generate_vocab_mapping_file
-        )
-        vocab_kwargs = {}
+        from specforge.data.preprocessing import build_eagle3_dataset
 
     train_dataset = (
         load_dataset("csv", data_files=args.train_data_path, delimiter="\t")["train"]
@@ -398,7 +390,7 @@ def main():
             draft_vocab_size=draft_model_config.draft_vocab_size,
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
-            **vocab_kwargs
+            num_proc=args.build_dataset_num_proc
         )
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
@@ -444,7 +436,7 @@ def main():
         )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
-            args.batch_size,
+            args.draft_micro_batch_size,
             num_workers=4,
             shuffle=False,
             process_group=get_dp_group(),

@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import re
 import warnings
@@ -469,6 +470,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
             data = self._open_file(0)
+        # print(f"RANK {torch.distributed.get_rank()}: Loaded!")
         return self.process_data(data, self.max_len, self.transform)
 
     def set_epoch(self, epoch):
@@ -494,9 +496,11 @@ def generate_vocab_mapping_file(
     draft_vocab_size: int,
     cache_dir: str = "./cache/vocab_mapping",
     cache_key: str = "vocab_mapping",
+    num_proc: int = 1
 ) -> str:
     """
     Generate a vocab mapping file for the dataset.
+    Custom implementation with parallel counting.
 
     Args:
         dataset: The dataset to process.
@@ -516,15 +520,19 @@ def generate_vocab_mapping_file(
         print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
         return vocab_mapping_path
 
-    # we first count the frequency of effectiev tokens in the dataset
+    original_cols = dataset.column_names
+    batch_size = 1000
+    processed_dataset = dataset.map(
+        count_tokens,
+        batched=True,
+        num_proc=num_proc,
+        batch_size=batch_size,
+        remove_columns=original_cols
+    )
+
     token_dict = Counter()
-    for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
-        input_ids = item["input_ids"]
-        loss_mask = item["loss_mask"]
-        masked_ids = input_ids[loss_mask == 1]
-        unique_ids, counts = masked_ids.unique(return_counts=True)
-        batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
-        token_dict.update(batch_token_dict)
+    for partial_dict in processed_dataset["token_dict"]:
+        token_dict.update({int(tok): freq for tok, freq in json.loads(partial_dict).items()})
 
     # generate the d2t and t2d mapping
     d2t, t2d = process_token_dict_to_mappings(
@@ -540,6 +548,15 @@ def generate_vocab_mapping_file(
     torch.save(vocab_mapping, vocab_mapping_path)
     print(f"Saved vocab mapping to: {vocab_mapping_path}")
     return vocab_mapping_path
+
+
+def count_tokens(items: HFDataset) -> Counter:
+    input_ids = items["input_ids"]
+    loss_mask = items["loss_mask"]
+    masked_ids = input_ids[loss_mask == 1]
+    unique_ids, counts = masked_ids.unique(return_counts=True)
+    batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
+    return {"token_dict": [json.dumps(batch_token_dict)]}
 
 
 def process_token_dict_to_mappings(

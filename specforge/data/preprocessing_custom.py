@@ -1,8 +1,8 @@
 import os
 import json
 import warnings
-from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple, Union
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from datasets import Dataset as HFDataset
@@ -14,10 +14,15 @@ from .format_openai import (
 )
 from .template import ChatTemplate, TEMPLATE_REGISTRY
 
+from specforge.data.preprocessing import OfflineEagle3Dataset
 
-# This flag is required for OOM testing:
-# it builds dataset with input_ids with maximum length
-TESTING = False
+try:
+    import yt.wrapper as yt
+    import yt.yson as yson
+    YT_AVAILABLE = True
+except ImportError:
+    print("Could not import YT requirements, will not be able to data points from YT")
+    YT_AVAILABLE = False
 
 
 def build_loss_mask(
@@ -119,7 +124,9 @@ def preprocess_conversations(
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
     for conv_str, tools_str, _ in zip(conversations, tools, kwargs_list):
-        if TESTING:
+        # This flag is required for OOM testing:
+        # it builds dataset with input_ids with maximum length
+        if os.environ.get("TESTING", "0") == "1":
             results["input_ids"].append(
                 torch.randint(0, len(tokenizer), (1, max_length), dtype=torch.long)
             )
@@ -290,123 +297,123 @@ def build_eagle3_dataset(
     return dataset
 
 
-# ==============================
-# Vocab Mapping
-# ==============================
-def generate_vocab_mapping_file(
-    dataset: HFDataset,
-    target_vocab_size: int,
-    draft_vocab_size: int,
-    cache_dir: str = "./cache/vocab_mapping",
-    cache_key: str = "vocab_mapping",
-    num_proc: int = 1
-) -> str:
-    """
-    Generate a vocab mapping file for the dataset.
+class OfflineEagle3YTTableDataset(OfflineEagle3Dataset):
+    def __init__(self, datapath, transform=None, max_len=2048, seed=None):
+        assert datapath.startswith("yt:"), "YT source should start with 'yt:'"
 
-    Args:
-        dataset: The dataset to process.
-        target_vocab_size: The target vocabulary size.
-        draft_vocab_size: The draft vocabulary size.
-        cache_dir: The directory to use for caching the vocab mapping file.
-        cache_key: The key to use for caching the vocab mapping file.
+        super().__init__([datapath], transform, max_len)
+        self.seed = seed
 
-    Returns:
-        The path to the vocab mapping file.
-    """
-    # prepare cache direcotory
-    os.makedirs(cache_dir, exist_ok=True)
-    vocab_mapping_path = os.path.join(cache_dir, f"{cache_key}.pt")
+        self.yt_config = yt.default_config.get_config_from_env()
+        # self.yt_config["enable_rpc_proxy_in_job_proxy"] = True
+        # self.yt_config["backend"] = "rpc"
+        self.yt_config["read_parallel"]["enable"] = True
+        self.yt_config["read_parallel"]["max_thread_count"] = 32
 
-    if os.path.exists(vocab_mapping_path):
-        print(f"Loading vocab mapping from the cached file at: {vocab_mapping_path}")
-        return vocab_mapping_path
+        self.proxy, self.yt_table_path = datapath[3:].split("/", 1)
+        self._reset_reader(init=True)
 
-    original_cols = dataset.column_names
-    batch_size = 1000
-    processed_dataset = dataset.map(
-        count_tokens,
-        batched=True,
-        num_proc=num_proc,
-        batch_size=batch_size,
-        remove_columns=original_cols
+
+    def _reset_reader(self, init=False):
+        if not init:
+            del self.reader
+            del self.yt_client
+
+        # table_reader = {"window_size": 5368709120, "max_buffer_size": 10737418240}  # 5 GiB / 10 GiB
+        # if self.seed:
+        #     table_reader.update({"sampling_mode": "row", "sampling_rate": 1, "sampling_seed": self.dp_seed})
+
+        self.yt_client = yt.YtClient(proxy=self.proxy, token=os.environ['YT_TOKEN'], config=self.yt_config)
+        self.reader = self.yt_client.read_table(self.yt_table_path, enable_read_parallel=True)
+        self.index = 0
+
+        if init:
+            self.total_rows = self.yt_client.get_attribute(self.yt_table_path, "path_count")
+            print(f"Found {self.total_rows} in training YT table")
+
+    @property
+    def dp_seed(self):
+        rank, world_size = torch.distributed.get_rank(), torch.distributed.get_world_size()
+        return self.seed + world_size * self._epoch + rank
+
+    def __len__(self):
+        return self.total_rows
+
+    def _open_file(self):
+        buffer = BytesIO()
+        try:
+            while True:
+                row = next(self.reader)
+
+                # print(f"RANK {torch.distributed.get_rank()}: INDEX {self.index} -> {row["file_path"]}:{row["index"]}")
+                self.index += 1
+
+                buffer.write((yson.get_bytes(row["data"])))
+                if not row["has_next"]:
+                    # print(f"RANK {torch.distributed.get_rank()}: HIT END")
+                    break
+
+            buffer.seek(0)
+            return torch.load(buffer, weights_only=False)
+        except Exception as e:
+            print(f"ERROR Failed to load {row["file_path"]} with error {e}")
+            raise e
+
+    def __getitem__(self, index):
+        return self.process_data(self._open_file(), self.max_len, self.transform)
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+        self._reset_reader()
+
+
+def build_offline_eagle3_yt_table_dataset(
+    hidden_states_path: str,
+    max_len: int = 2048,
+    seed: Optional[int] = None
+) -> torch.utils.data.Dataset:
+    if not YT_AVAILABLE:
+        raise ImportError("Error while importing YT requirements, try running `pip imstall -r requirements_yt.txt`")
+
+    return OfflineEagle3YTTableDataset(
+        hidden_states_path,
+        max_len=max_len,
+        seed=seed
     )
 
-    token_dict = Counter()
-    for partial_dict in processed_dataset["token_dict"]:
-        token_dict.update({int(tok): freq for tok, freq in json.loads(partial_dict).items()})
 
-    # generate the d2t and t2d mapping
-    d2t, t2d = process_token_dict_to_mappings(
-        token_dict,
-        draft_vocab_size,
-        target_vocab_size,
+# Unline list_local_files, does not expect any subdirectories
+def list_yt_files(client: yt.YtClient, path: str, suffixes=[".ckpt"]):
+    datapaths = [os.path.join(path, file) for file in client.list(path)]
+    for suffix in suffixes:
+        datapaths = [f_name for f_name in datapaths if f_name.endswith(suffix)]
+    return datapaths
+
+
+class OfflineEagle3YTDataset(OfflineEagle3Dataset):
+    def __init__(self, datapath, transform=None, max_len=2048):
+        super().__init__(datapath, transform, max_len)
+
+        self.yt_client = yt.YtClient(proxy="hahn", token=os.environ['YT_TOKEN'])
+
+    def _open_file(self, index):
+        # print(f"RANK {torch.distributed.get_rank()}: Trying to load {self.datapaths[index]} ({index})")
+        data = self.yt_client.read_file(path=self.datapaths[index], enable_read_parallel=True)
+        return torch.load(BytesIO(initial_bytes=data.read()), weights_only=False)
+
+
+def build_offline_eagle3_yt_dataset(
+    hidden_states_path: str,
+    max_len: int = 2048
+) -> torch.utils.data.Dataset:
+    if not YT_AVAILABLE:
+        raise ImportError("Error while importing YT requirements, try running `pip imstall -r requirements_yt.txt`")
+
+    assert hidden_states_path.startswith("yt:"), "YT source should start with 'yt:'"
+    proxy, yt_table_path = hidden_states_path[3:].split("/", 1)
+    yt_client = yt.YtClient(proxy=proxy, token=os.environ['YT_TOKEN'])
+
+    return OfflineEagle3YTDataset(
+        list_yt_files(yt_client, yt_table_path),
+        max_len=max_len
     )
-
-    vocab_mapping = {
-        "d2t": d2t,
-        "t2d": t2d,
-    }
-    torch.save(vocab_mapping, vocab_mapping_path)
-    print(f"Saved vocab mapping to: {vocab_mapping_path}")
-    return vocab_mapping_path
-
-
-def count_tokens(items: HFDataset) -> Counter:
-    input_ids = items["input_ids"]
-    loss_mask = items["loss_mask"]
-    masked_ids = input_ids[loss_mask == 1]
-    unique_ids, counts = masked_ids.unique(return_counts=True)
-    batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))
-    return {"token_dict": [json.dumps(batch_token_dict)]}
-
-
-def process_token_dict_to_mappings(
-    token_dict: Counter,
-    draft_vocab_size: int,
-    target_vocab_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Process token_dict to create d2t and t2d mappings, with optional caching.
-
-    Args:
-        token_dict: A Counter object mapping token ids to their frequencies.
-        draft_vocab_size: The size of the draft vocabulary.
-        target_vocab_size: The size of the target vocabulary.
-
-    Returns:
-        A tuple containing:
-            - d2t: A tensor mapping draft token ids to target token ids.
-            - t2d: A tensor mapping target token ids to draft token ids.
-    """
-    if len(token_dict) < draft_vocab_size:
-        existing_tokens = set(token_dict.keys())
-        missing_tokens = set(range(draft_vocab_size)) - existing_tokens
-        for token in missing_tokens:
-            token_dict[token] = 0
-            if len(token_dict) >= draft_vocab_size:
-                break
-    print(f"Added missing tokens to reach draft vocab size: {draft_vocab_size}")
-    print(f"Total tokens after addition: {len(token_dict)}")
-    total_frequency = sum(token_dict.values())
-    top_N = token_dict.most_common(draft_vocab_size)
-    top_N_frequency_sum = sum(freq for key, freq in top_N)
-
-    if total_frequency == 0:
-        print(
-            "Warning: Total token frequency is zero. All tokens will have zero ratio."
-        )
-        top_N_ratio = 0.0
-    else:
-        top_N_ratio = top_N_frequency_sum / total_frequency
-
-    print(f"top {draft_vocab_size} token frequency ratio: {top_N_ratio:.2%}")
-    used_tokens = [key for key, freq in top_N]
-    used_tokens.sort()
-
-    d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
-    t2d = [i in used_tokens for i in range(target_vocab_size)]
-    d2t = torch.tensor(d2t)
-    t2d = torch.tensor(t2d)
-
-    return d2t, t2d

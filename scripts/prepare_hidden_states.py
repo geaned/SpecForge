@@ -7,13 +7,16 @@ By generating hidden states in advance, we can avoid:
 
 import argparse
 import hashlib
+import io
 import os
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn as nn
+import yt.wrapper as yt
 from datasets import Dataset, load_dataset
 from sglang.bench_one_batch import BenchArgs, load_model
 from sglang.srt.entrypoints.engine import _set_envs_and_config
@@ -35,8 +38,7 @@ from sglang.srt.utils import (
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
-from specforge.data import build_eagle3_dataset
-from specforge.utils import print_with_rank, rank_0_priority
+from specforge.utils import print_with_rank, rank_0_priority, print_on_rank0
 
 
 class LogitsProcessorForEAGLE3(torch.nn.Module):
@@ -114,6 +116,30 @@ class SglangHiddenStatesGenerator:
                 f"Capturing Aux hidden states layers: {args.aux_hidden_states_layers}, num_layers: {num_layers}"
             )
 
+        # For testing with large random tensors as input
+        self.testing = (os.environ.get("TESTING", "0") == "1")
+        self.vocab_size = len(AutoTokenizer.from_pretrained(self.server_args.tokenizer_path))
+
+        self.yt_client = None
+        self.yt_write_table = (os.environ.get("YT_TABLE_MODE", "0") == "1")
+        if self.args.output_path.startswith("yt:"):
+            yt_config = yt.default_config.get_config_from_env()
+            # Separate proxy for fast download/upload
+            # self.yt_config["enable_rpc_proxy_in_job_proxy"] = True
+            # self.yt_config["backend"] = "rpc"
+            yt_config["write_parallel"]["enable"] = True
+            yt_config["write_parallel"]["max_thread_count"] = 100
+
+            proxy, table_path = self.args.output_path[3:].split("/", 1)
+            self.yt_client = yt.YtClient(proxy=proxy, token=os.environ['YT_TOKEN'], config=yt_config)
+            self.args.output_path = yt.TablePath(table_path, append=True)
+            with rank_0_priority():
+                if self.tp_rank == 0:
+                    if self.yt_client.exists(self.args.output_path):
+                        self.yt_client.remove(self.args.output_path)
+                    if not self.yt_write_table:
+                        self.yt_client.create('map_node', self.args.output_path)
+
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch, model_runner):
         if require_mlp_sync(model_runner.server_args):
             Scheduler.prepare_mlp_sync_batch_raw(
@@ -173,16 +199,47 @@ class SglangHiddenStatesGenerator:
         return hidden_states_list, aux_hidden_states_list
 
     def _save_tensor(self, hidden_states_cpu, save_aux_hidden_states):
+
+        def _split_for_yt(data_point, output_file):
+            buffer = io.BytesIO()
+            torch.save(data_point, buffer)
+            buffer.seek(0)
+
+            file_path = output_file.split('/')[-1]
+            idx, data, chunk = 0, [], buffer.read(16777216)
+            while new_chunk := buffer.read(16777216):
+                data.append({"file_path": file_path, "index": idx, "has_next": True, "data": chunk})
+                chunk = new_chunk
+                idx += 1
+            data.append({"file_path": file_path, "index": idx, "has_next": False, "data": chunk})
+
+            for part in data:
+                part["total_length"] = len(data)
+
+            return data
+
         for idx, (hidden_states, batch_save_info) in enumerate(hidden_states_cpu):
             if idx % torch.distributed.get_world_size() != torch.distributed.get_rank():
                 continue
             hidden_states_list, aux_hidden_states_list = hidden_states
+            data_split = []
             if save_aux_hidden_states:
                 for hidden_state, aux_hidden_state, (data_point, output_file) in zip(
                     hidden_states_list, aux_hidden_states_list, batch_save_info
                 ):
-                    data_point["hidden_state"] = hidden_state.clone().unsqueeze(0).cpu()
+                    data_point["hidden_state"] = (
+                        torch.randn(
+                            (1, self.server_args.context_length, hidden_state.shape[-1]),
+                            dtype=hidden_state.dtype
+                        )
+                        if self.testing else
+                        hidden_state.clone().unsqueeze(0).cpu()
+                    )
                     data_point["aux_hidden_state"] = (
+                        torch.randn(
+                            (1, self.server_args.context_length, aux_hidden_state.shape[-1]),
+                            dtype=aux_hidden_state.dtype)
+                        if self.testing else
                         aux_hidden_state.clone().unsqueeze(0).cpu()
                     )
                     assert not torch.any(
@@ -191,12 +248,41 @@ class SglangHiddenStatesGenerator:
                     assert not torch.any(
                         torch.isnan(data_point["aux_hidden_state"])
                     ), "aux_hidden_state is expected to be non-nan"
-                    torch.save(data_point, output_file)
+
+                    if self.yt_client is None:
+                        torch.save(data_point, output_file)
+
+                    else:
+                        buffer = io.BytesIO()
+                        torch.save(data_point, buffer)
+                        buffer.seek(0)
+
+                        if self.yt_write_table:
+                            data_split.extend(_split_for_yt(data_point, output_file))
+                        else:
+                            self.yt_client.write_file(output_file, buffer)
+
+                # Execute single-pass write only if writing to YT table
+                if self.yt_client is not None and self.yt_write_table:
+                    try:
+                        self.yt_client.write_table(
+                            table=self.args.output_path,
+                            input_stream=data_split,
+                            format=yt.YsonFormat(),
+                            table_writer={"max_row_weight": 134217728},
+                        )
+                        break
+                    except yt.errors.YtCypressTransactionLockConflict:
+                        time.sleep(5)
+
             else:
                 for hidden_state, (data_point, output_file) in zip(
                     hidden_states_list, batch_save_info
                 ):
-                    data_point["hidden_state"] = hidden_state.clone().unsqueeze(0).cpu()
+                    data_point["hidden_state"] = (
+                        torch.randn((1, self.server_args.context_length, hidden_state.shape[-1]), dtype=hidden_state.dtype)
+                        if self.testing else hidden_state.clone().unsqueeze(0).cpu()
+                    )
                     assert not torch.any(
                         torch.isnan(data_point["hidden_state"])
                     ), "hidden_state is expected to be non-nan"
@@ -250,11 +336,18 @@ class SglangHiddenStatesGenerator:
             if self.tp_rank == 0 and not os.path.exists(
                 f"{self.args.output_path}/{grouped_subdir}"
             ):
-                os.makedirs(f"{self.args.output_path}/{grouped_subdir}")
+                if self.yt_client is None:
+                    os.makedirs(f"{self.args.output_path}/{grouped_subdir}")
 
-            output_file = f"{self.args.output_path}/{grouped_subdir}/data_{idx}.ckpt"
+            if self.yt_client is None:
+                output_file = f"{self.args.output_path}/{grouped_subdir}/data_{idx}.ckpt"
+            else:
+                # Remove unnecessary subdir for YT
+                output_file = f"{self.args.output_path}/data_{idx}.ckpt"
+
             if (
-                os.path.exists(output_file)
+                self.yt_client is None
+                and os.path.exists(output_file)
                 and os.path.getsize(output_file) > MIN_FILE_SIZE
             ):
                 continue
@@ -262,8 +355,14 @@ class SglangHiddenStatesGenerator:
             batch_save_info.append(
                 (
                     {
-                        "input_ids": row["input_ids"].view(-1),
-                        "loss_mask": row["loss_mask"].view(-1),
+                        "input_ids": (
+                            torch.randint(0, self.vocab_size, (self.server_args.context_length, ), dtype=torch.long)
+                            if self.testing else row["input_ids"].view(-1)
+                        ),
+                        "loss_mask": (
+                            torch.ones(self.server_args.context_length, dtype=torch.long)
+                            if self.testing else row["loss_mask"].view(-1)
+                        ),
                     },
                     output_file,
                 )
@@ -285,7 +384,7 @@ class SglangHiddenStatesGenerator:
                     reqs, self.model_runner, self.args.enable_aux_hidden_states
                 )
                 hidden_states_cpu.append((hidden_states_list, batch_save_info[:]))
-                if len(hidden_states_cpu) >= 64:
+                if len(hidden_states_cpu) >= self.args.batch_size_to_save:
                     torch.cuda.synchronize()
                     self._save_tensor(
                         hidden_states_cpu,
@@ -308,6 +407,9 @@ class SglangHiddenStatesGenerator:
                 )
             )
 
+        if self.tp_rank == 0 and self.yt_client is not None and not self.yt_write_table:
+            self.yt_client.set_attribute(self.args.output_path, "path_count", self.args.path_count)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -321,6 +423,7 @@ def parse_args():
     parser.add_argument("--enable-aux-hidden-states", action="store_true")
     parser.add_argument("--aux-hidden-states-layers", type=str, default=None)
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+    parser.add_argument("--batch-size-to-save", type=int, default=64)
 
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
@@ -354,7 +457,19 @@ def main():
         root_path = Path(__file__).parent.parent
         args.output_path = root_path.joinpath("cache", "hidden_states")
 
-    dataset = load_dataset("json", data_files=args.data_path)["train"]
+    custom_preprocessing = "custom" in args.chat_template
+    if custom_preprocessing:
+        print_on_rank0("Using custom preprocessing implementation")
+        from specforge.data.preprocessing_custom import build_eagle3_dataset
+    else:
+        print_on_rank0("Using base preprocessing implementation")
+        from specforge.data.preprocessing import build_eagle3_dataset
+
+    dataset = (
+        load_dataset("csv", data_files=args.data_path, delimiter="\t")["train"]
+        if custom_preprocessing else
+        load_dataset("json", data_files=args.data_path)["train"]
+    )
     if args.num_samples is not None:
         dataset = dataset.select(range(args.num_samples))
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
@@ -375,6 +490,7 @@ def main():
             cache_key=cache_key,
             num_proc=args.build_dataset_num_proc,
         )
+        args.path_count = len(eagle3_dataset)
         print_with_rank("Built dataset")
 
     hidden_states_generator = SglangHiddenStatesGenerator(
