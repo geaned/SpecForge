@@ -1,10 +1,12 @@
-import argparse
 import hashlib
 import math
 import os
 import time
+import shutil
+import subprocess
 from collections import defaultdict
 
+import configargparse
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
@@ -38,10 +40,23 @@ from specforge.utils import (
     rank_0_priority,
 )
 
+try:
+    import nirvana.job_context as nv
+    print("Nirvana job context imported successully!")
+    NV_JOB_CONTEXT = True
+except ImportError:
+    NV_JOB_CONTEXT = False
+
+NV_EXT_SUFFIX = "_extracted"
+
 
 def save_model(model, state, output_dir):
     # Save the model
     if dist.get_rank() == 0:
+        if NV_JOB_CONTEXT:
+            tar_output_dir = output_dir.split("/")[-1]
+            output_dir = tar_output_dir + NV_EXT_SUFFIX
+            shutil.rmtree(output_dir)
         os.makedirs(output_dir, exist_ok=True)
     dist.barrier()
 
@@ -66,14 +81,47 @@ def save_model(model, state, output_dir):
                 state_dict=draft_model_state_dict,
             )
             print_on_rank0(f"Saved model configuration to {output_dir}")
+        
+            if NV_JOB_CONTEXT:
+                print_on_rank0(f"Saving compressed output to {tar_output_dir}...")
+                subprocess.run(['tar', '-cvf', output_dir, '-C', tar_output_dir])
         dist.barrier()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
+    params_path = None
+
+    if NV_JOB_CONTEXT:
+        nv_ctx = nv.context()
+        inputs = nv_ctx.get_inputs()
+        outputs = nv_ctx.get_outputs()
+        # nv_params = nv_ctx.get_parameters()
+        print(f"Nirvana inputs:")
+        print(inputs)
+        print(f"Nirvana outputs:")
+        print(outputs)
+        # print(f"Nirvana params:")
+        # print(nv_params)
+        params_path = inputs.get('params')
+
+    if not params_path:
+        params_path = os.environ.get("YAML_CONFIG_PATH", "")
+
+    config_files = []
+    if params_path:
+        print(f"Reading config from {params_path}...")
+        config_files.append(params_path)
+
+    config_files = [params_path] if NV_JOB_CONTEXT else []
+    parser = configargparse.ArgumentParser(
+        default_config_files=config_files,
+        config_file_parser_class=configargparse.YAMLConfigFileParser,
+        description="Train Eagle3 with online data"
+    )
+    nv_inputs_disabled = not NV_JOB_CONTEXT
 
     # add model-related arguments
-    parser.add_argument("--target-model-path", type=str, required=True)
+    parser.add_argument("--target-model-path", type=str, required=nv_inputs_disabled)
     parser.add_argument(
         "--draft-model-config",
         type=str,
@@ -225,6 +273,13 @@ def parse_args():
 
     args = parser.parse_args()
 
+    if NV_JOB_CONTEXT:
+        args.target_model_path = inputs.get('model')
+        args.train_data_path = inputs.get('train_data')
+        args.eval_data_path = inputs.get('eval_data')
+        args.output_dir = outputs.get('spec_model') + NV_EXT_SUFFIX
+        # TODO: logs to separate output
+
     return parser, args
 
 
@@ -273,6 +328,16 @@ def main():
         print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
         print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+
+    print_on_rank0(f"Loading target model from {args.target_model_path}...")
+    if NV_JOB_CONTEXT:
+        draft_model_last_checkpoint = None
+        with rank_0_priority():
+            ext_target_model_path = args.target_model_path + NV_EXT_SUFFIX
+            print_on_rank0(f"Extracting target model to {ext_target_model_path}...")
+            if dist.get_rank() == 0:
+                subprocess.run(['tar', '-xvf', args.target_model_path, '-C', ext_target_model_path])
+            args.target_model_path = ext_target_model_path
 
     # build target and draft model
     if args.tp_size > 1:
@@ -366,6 +431,7 @@ def main():
         print_on_rank0("Using base preprocessing implementation")
         from specforge.data.preprocessing import build_eagle3_dataset
 
+    print(f"Loading training dataset from {args.train_data_path}...")
     train_dataset = (
         load_dataset("csv", data_files=args.train_data_path, delimiter="\t")["train"]
         if custom_preprocessing else
@@ -418,6 +484,7 @@ def main():
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
 
+    print(f"Loading evaluation dataset from {args.train_data_path}...")
     if args.eval_data_path is not None:
         eval_dataset = (
             load_dataset("csv", data_files=args.eval_data_path, delimiter="\t")["train"]

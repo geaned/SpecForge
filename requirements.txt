@@ -16,3 +16,4 @@ sglang[all]==0.5.1
 openai-harmony
 sentencepiece
 tensorboardX
+configargparse
