@@ -5,7 +5,7 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from datasets import Dataset as HFDataset
+from datasets import Dataset as HFDataset, load_dataset
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
 
 from .format_openai import (
@@ -417,3 +417,22 @@ def build_offline_eagle3_yt_dataset(
         list_yt_files(yt_client, yt_table_path),
         max_len=max_len
     )
+
+
+def multi_load_dataset(dataset_path: str, columns: List[str], yt_token: str = None) -> HFDataset:
+    if dataset_path.endswith(".csv"):
+        dataset = load_dataset("csv", data_files=dataset_path, columns=columns)["train"]
+    elif dataset_path.endswith(".tsv"):
+        dataset = load_dataset("csv", data_files=dataset_path, columns=columns, delimiter="\t")["train"]
+    elif dataset_path.endswith(".json"):
+        dataset = load_dataset("json", data_files=dataset_path, columns=columns)["train"]
+    elif dataset_path.startswith("yt:"):
+        proxy, yt_table_path = dataset_path[3:].split("/", 1)
+        yt_client = yt.YtClient(proxy=proxy, token=yt_token)
+        data = {col: [] for col in columns}
+        for row in yt_client.read_table(yt_table_path, format=yt.YsonFormat(), columns=columns):
+            for col in columns:
+                data[col].append(row[col])
+        dataset = HFDataset.from_dict(data)
+
+    return dataset

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import math
 import os
 import time
@@ -10,7 +11,6 @@ import configargparse
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
-from datasets import load_dataset
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictType
 from tqdm import tqdm
@@ -23,7 +23,11 @@ from specforge import (
     OnlineEagle3Model,
     QwenVLOnlineEagle3Model,
 )
-from specforge.data import generate_vocab_mapping_file, prepare_dp_dataloaders
+from specforge.data import (
+    generate_vocab_mapping_file,
+    multi_load_dataset,
+    prepare_dp_dataloaders
+)
 from specforge.distributed import (
     destroy_distributed,
     get_dp_group,
@@ -139,7 +143,8 @@ def parse_args():
     )
 
     # add training-related arguments
-    parser.add_argument("--train-data-path", type=str, required=True)
+    parser.add_argument("--yt-token", type=str, default=None)
+    parser.add_argument("--train-data-path", type=str, required=nv_inputs_disabled)
     parser.add_argument("--eval-data-path", type=str, default=None)
     parser.add_argument("--num-epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1, help="deprecated: use --draft-micro-batch-size")
@@ -186,7 +191,7 @@ def parse_args():
     # other args
     parser.add_argument("--cache-key", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default="./cache")
-    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, required=nv_inputs_disabled)
     parser.add_argument("--eval-interval", type=int, default=1)
     parser.add_argument(
         "--save-strategy", type=str, default="epochs", choices=["epochs", "steps"]
@@ -275,11 +280,20 @@ def parse_args():
 
     if NV_JOB_CONTEXT:
         args.target_model_path = inputs.get('model')
-        args.train_data_path = inputs.get('train_data')
-        args.eval_data_path = inputs.get('eval_data')
+        args.draft_model_config = inputs.get('drafter_config')
+        args.yt_token = nv_params.get('yt-token')
+        train_cluster, train_table = json.loads(inputs.get('train_data').path)
+        args.train_data_path = f"yt:{train_cluster}/{train_table}"
+        eval_cluster, eval_table = json.loads(inputs.get('eval_data').path)
+        args.eval_data_path = f"yt:{eval_cluster}/{eval_table}"
         args.output_dir = outputs.get('spec_model') + NV_EXT_SUFFIX
         # TODO: logs to separate output
 
+    if not args.yt_token:
+        args.yt_token = os.environ.get("YT_TOKEN")
+
+    print(f"Arguments:")
+    print(args)
     return parser, args
 
 
@@ -432,11 +446,7 @@ def main():
         from specforge.data.preprocessing import build_eagle3_dataset
 
     print(f"Loading training dataset from {args.train_data_path}...")
-    train_dataset = (
-        load_dataset("csv", data_files=args.train_data_path, delimiter="\t")["train"]
-        if custom_preprocessing else
-        load_dataset("json", data_files=args.train_data_path)["train"]
-    )
+    train_dataset = multi_load_dataset(args.train_data_path, columns=['request_id', 'messages', 'tools'], yt_token=args.yt_token)
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -486,11 +496,7 @@ def main():
 
     print(f"Loading evaluation dataset from {args.train_data_path}...")
     if args.eval_data_path is not None:
-        eval_dataset = (
-            load_dataset("csv", data_files=args.eval_data_path, delimiter="\t")["train"]
-            if custom_preprocessing else
-            load_dataset("json", data_files=args.eval_data_path)["train"]
-        )
+        eval_dataset = multi_load_dataset(args.eval_data_path)
         eval_eagle3_dataset = build_eagle3_dataset(
             eval_dataset,
             tokenizer,
