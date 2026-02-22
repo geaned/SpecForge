@@ -95,13 +95,13 @@ def parse_args():
         nv_ctx = nv.context()
         inputs = nv_ctx.get_inputs()
         outputs = nv_ctx.get_outputs()
-        # nv_params = nv_ctx.get_parameters()
+        nv_params = nv_ctx.get_parameters()
         print(f"Nirvana inputs:")
         print(inputs)
         print(f"Nirvana outputs:")
         print(outputs)
-        # print(f"Nirvana params:")
-        # print(nv_params)
+        print(f"Nirvana params:")
+        print(nv_params)
         params_path = inputs.get('params')
 
     if not params_path:
