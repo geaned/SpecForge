@@ -430,9 +430,15 @@ def multi_load_dataset(dataset_path: str, columns: List[str], yt_token: str = No
         proxy, yt_table_path = dataset_path[3:].split("/", 1)
         yt_client = yt.YtClient(proxy=proxy, token=yt_token)
         data = {col: [] for col in columns}
-        for row in yt_client.read_table(yt_table_path, format=yt.YsonFormat(), columns=columns):
+        for row in yt_client.read_table(
+            yt.TablePath(yt_table_path, columns=columns),
+            format=yt.YsonFormat(),
+            enable_read_parallel=True
+        ):
             for col in columns:
                 data[col].append(row[col])
         dataset = HFDataset.from_dict(data)
+    else:
+        raise ValueError(f"Could not find loading method for path {dataset_path}")
 
     return dataset
