@@ -88,7 +88,7 @@ def save_model(model, state, output_dir):
         
             if NV_JOB_CONTEXT:
                 print_on_rank0(f"Saving compressed output to {tar_output_dir}...")
-                subprocess.run(['tar', '-cvf', output_dir, '-C', tar_output_dir])
+                subprocess.run(['tar', '-cvf', tar_output_dir, '-C', output_dir, '.'])
         dist.barrier()
 
 
@@ -350,6 +350,7 @@ def main():
             ext_target_model_path = args.target_model_path + NV_EXT_SUFFIX
             print_on_rank0(f"Extracting target model to {ext_target_model_path}...")
             if dist.get_rank() == 0:
+                os.mkdir(ext_target_model_path)
                 subprocess.run(['tar', '-xvf', args.target_model_path, '-C', ext_target_model_path])
             args.target_model_path = ext_target_model_path
 
