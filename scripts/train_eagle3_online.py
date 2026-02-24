@@ -282,10 +282,10 @@ def parse_args():
         args.target_model_path = inputs.get('model')
         args.draft_model_config = inputs.get('drafter_config')
         args.yt_token = nv_params.get('yt-token')
-        train_cluster, train_table = json.load(open(inputs.get('train_data')))
-        args.train_data_path = f"yt:{train_cluster}/{train_table}"
-        eval_cluster, eval_table = json.load(open(inputs.get('eval_data')))
-        args.eval_data_path = f"yt:{eval_cluster}/{eval_table}"
+        train_data = json.load(open(inputs.get('train_data')))
+        args.train_data_path = f"yt:{train_data['cluster']}/{train_data['table']}"
+        eval_data = json.load(open(inputs.get('eval_data')))
+        args.eval_data_path = f"yt:{eval_data['cluster']}/{eval_data['table']}"
         args.output_dir = outputs.get('spec_model') + NV_EXT_SUFFIX
         # TODO: logs to separate output
 
