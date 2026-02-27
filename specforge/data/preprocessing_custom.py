@@ -8,10 +8,6 @@ import torch
 from datasets import Dataset as HFDataset, load_dataset
 from transformers import ImageProcessingMixin, PreTrainedTokenizer
 
-from .format_openai import (
-    format_openai_messages_to_yagpt,
-    format_openai_tools_to_yagpt
-)
 from .template import ChatTemplate, TEMPLATE_REGISTRY
 
 from specforge.data.preprocessing import OfflineEagle3Dataset
@@ -119,11 +115,12 @@ def preprocess_conversations(
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
 
     tools = kwargs.pop("tools", [[]]*len(conversations))
+    reqids = kwargs.pop("reqids", [""]*len(conversations))
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
-    for conv_str, tools_str, _ in zip(conversations, tools, kwargs_list):
+    for conv_str, tools_str, reqid, _ in zip(conversations, tools, reqids, kwargs_list):
         # This flag is required for OOM testing:
         # it builds dataset with input_ids with maximum length
         if os.environ.get("TESTING", "0") == "1":
@@ -143,21 +140,31 @@ def preprocess_conversations(
                 return_tensors="pt"
             ).input_ids[0]
         else:
-            conv_dict = json.loads(conv_str)
-            tools_dict = json.loads(tools_str)
-            if "openai" in chat_template:
-                conv_dict = format_openai_messages_to_yagpt(conv_dict)
-                tools_dict = format_openai_tools_to_yagpt(tools_dict)
+            try:
+                conv_dict = json.loads(conv_str)
+                tools_dict = json.loads(tools_str)
 
-            input_ids = tokenizer.apply_chat_template(
-                conversation=conv_dict,
-                tools=tools_dict,
-                add_generation_prompt=False,
-                truncation=True,
-                max_length=max_length,
-                add_special_tokens=False,
-                return_tensors="pt"
-            )[0]
+                prompt = tokenizer.apply_chat_template(
+                    conversation=conv_dict,
+                    tools=tools_dict,
+                    add_generation_prompt=False,
+                    truncation=True,
+                    max_length=max_length,
+                    add_special_tokens=False,
+                    tokenize=False
+                )
+
+                if "yagpt" in chat_template:
+                    yagpt_assistant, yagpt_sep_token = "Ассистент:", "[SEP]"
+                    insert_pos = prompt.rfind(yagpt_assistant) \
+                        + len(yagpt_assistant)
+                    prompt = prompt[:insert_pos] + yagpt_sep_token \
+                        + prompt[insert_pos:]
+                
+                input_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
+            except Exception as e:
+                print(f"Failed to parse row '{reqid}' during preprocessing")
+                raise e
 
         start_seq = tokenizer(chat_template_inst.assistant_header).input_ids
         end_seq = (
@@ -220,6 +227,10 @@ def build_eagle3_dataset(
     original_cols = dataset.column_names
 
     def preprocess_function(examples):
+        extra_kwargs = {}
+        if "request_id" in extra_kwargs:
+            extra_kwargs["reqids"] = examples["request_ids"]
+
         if is_preformatted:
             # Handle pre-formatted text (should be in "text" column)
             if "text" not in examples:
@@ -229,10 +240,10 @@ def build_eagle3_dataset(
             processed = preprocess_conversations(
                 tokenizer=tokenizer,
                 conversations=examples["text"],
-                tools=[list()]*len(examples["text"]),
                 chat_template=chat_template,
                 max_length=max_length,
                 is_preformatted=True,
+                **extra_kwargs
             )
         else:
             # Handle ShareGPT conversations
@@ -247,12 +258,20 @@ def build_eagle3_dataset(
                 chat_template=chat_template,
                 max_length=max_length,
                 is_preformatted=False,
+                **extra_kwargs
             )
 
         return processed
 
     def filter_preprocessed(results):
-        return (torch.tensor(results["loss_mask"]).squeeze(1).sum(dim=-1) > 0).tolist()
+        return (
+            torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(x).squeeze() for x in results["loss_mask"]],
+                batch_first=True,
+                padding_side="left",
+                padding_value=0
+            ).sum(dim=-1) > 0
+        ).tolist()
 
     # Process dataset only once
     if cache_dir and cache_key:
@@ -269,13 +288,7 @@ def build_eagle3_dataset(
             f"cache_dir and cache_key must be provided together to make caching work"
         )
 
-    # adjust batch size based on dataset type
-    if is_vlm:
-        batch_size = (
-            200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
-        )
-    else:
-        batch_size = 1000  # default for conversations
+    batch_size = 1000
 
     dataset = dataset.map(
         preprocess_function,
@@ -419,25 +432,22 @@ def build_offline_eagle3_yt_dataset(
     )
 
 
-def multi_load_dataset(dataset_path: str, columns: List[str], yt_token: str = None) -> HFDataset:
+def multi_load_dataset(dataset_path: str, columns: List[str]) -> HFDataset:
     if dataset_path.endswith(".csv"):
-        dataset = load_dataset("csv", data_files=dataset_path, columns=columns)["train"]
+        dataset = load_dataset("csv", data_files=dataset_path)["train"]
+        dataset = dataset.remove_columns(
+            [col for col in dataset.column_names if col not in columns]
+        )
     elif dataset_path.endswith(".tsv"):
-        dataset = load_dataset("csv", data_files=dataset_path, columns=columns, delimiter="\t")["train"]
+        dataset = load_dataset("csv", data_files=dataset_path, delimiter="\t")["train"]
+        dataset = dataset.remove_columns(
+            [col for col in dataset.column_names if col not in columns]
+        )
     elif dataset_path.endswith(".json"):
-        dataset = load_dataset("json", data_files=dataset_path, columns=columns)["train"]
-    elif dataset_path.startswith("yt:"):
-        proxy, yt_table_path = dataset_path[3:].split("/", 1)
-        yt_client = yt.YtClient(proxy=proxy, token=yt_token)
-        data = {col: [] for col in columns}
-        for row in yt_client.read_table(
-            yt.TablePath(yt_table_path, columns=columns),
-            format=yt.YsonFormat(),
-            enable_read_parallel=True
-        ):
-            for col in columns:
-                data[col].append(row[col])
-        dataset = HFDataset.from_dict(data)
+        dataset = load_dataset("json", data_files=dataset_path)["train"]
+        dataset = dataset.remove_columns(
+            [col for col in dataset.column_names if col not in columns]
+        )
     else:
         raise ValueError(f"Could not find loading method for path {dataset_path}")
 

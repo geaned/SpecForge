@@ -6,6 +6,7 @@ import time
 import shutil
 import subprocess
 from collections import defaultdict
+from pathlib import Path
 
 import configargparse
 import torch
@@ -26,7 +27,8 @@ from specforge import (
 from specforge.data import (
     generate_vocab_mapping_file,
     multi_load_dataset,
-    prepare_dp_dataloaders
+    prepare_dp_dataloaders,
+    yt_pull_dataset
 )
 from specforge.distributed import (
     destroy_distributed,
@@ -46,7 +48,7 @@ from specforge.utils import (
 
 try:
     import nirvana.job_context as nv
-    print("Nirvana job context imported successully!")
+    print_with_rank("Nirvana job context imported successully!")
     NV_JOB_CONTEXT = True
 except ImportError:
     NV_JOB_CONTEXT = False
@@ -100,12 +102,6 @@ def parse_args():
         inputs = nv_ctx.get_inputs()
         outputs = nv_ctx.get_outputs()
         nv_params = nv_ctx.get_parameters()
-        print(f"Nirvana inputs:")
-        print(inputs)
-        print(f"Nirvana outputs:")
-        print(outputs)
-        print(f"Nirvana params:")
-        print(nv_params)
         params_path = inputs.get('params')
 
     if not params_path:
@@ -116,7 +112,6 @@ def parse_args():
         print(f"Reading config from {params_path}...")
         config_files.append(params_path)
 
-    config_files = [params_path] if NV_JOB_CONTEXT else []
     parser = configargparse.ArgumentParser(
         default_config_files=config_files,
         config_file_parser_class=configargparse.YAMLConfigFileParser,
@@ -213,7 +208,7 @@ def parse_args():
         "--report-to",
         type=str,
         default="none",
-        choices=["wandb", "tensorboard", "swanlab", "mlflow", "none"],
+        choices=["wandb", "tensorboard", "swanlab", "mlflow", "print", "none"],
         help="The integration to report results and logs to.",
     )
     # wandb-specific args
@@ -292,8 +287,6 @@ def parse_args():
     if not args.yt_token:
         args.yt_token = os.environ.get("YT_TOKEN")
 
-    print(f"Arguments:")
-    print(args)
     return parser, args
 
 
@@ -305,6 +298,7 @@ def main():
         torch.cuda.memory._record_memory_history(max_entries=1_000_000)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed environment")
+    print_on_rank0(f"Arguments\n{args}")
     args.dp_size = dist.get_world_size() // args.tp_size
     args.draft_accumulation_steps = (
         args.draft_global_batch_size // args.dp_size // args.draft_micro_batch_size
@@ -446,8 +440,22 @@ def main():
         print_on_rank0("Using base preprocessing implementation")
         from specforge.data.preprocessing import build_eagle3_dataset
 
-    print(f"Loading training dataset from {args.train_data_path}...")
-    train_dataset = multi_load_dataset(args.train_data_path, columns=['request_id', 'messages', 'tools'], yt_token=args.yt_token)
+    columns = ["request_id", "messages", "tools"]
+    print_with_rank(f"Loading training dataset from {args.train_data_path}...")
+    with rank_0_priority():
+        Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+        local_train_data_path = os.path.join(args.cache_dir, "train_dataset.tsv")
+        if (dist.get_rank() == 0 and args.train_data_path.startswith("yt:") \
+                and not os.path.exists(local_train_data_path)):
+            yt_pull_dataset(
+                args.train_data_path,
+                local_train_data_path,
+                token=args.yt_token,
+                columns=columns
+            )
+        args.train_data_path = local_train_data_path
+
+    train_dataset = multi_load_dataset(args.train_data_path, columns=columns)
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -495,9 +503,22 @@ def main():
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
 
-    print(f"Loading evaluation dataset from {args.train_data_path}...")
     if args.eval_data_path is not None:
-        eval_dataset = multi_load_dataset(args.eval_data_path)
+        with rank_0_priority():
+            Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+            local_eval_data_path = os.path.join(args.cache_dir, "eval_dataset.tsv")
+            if (dist.get_rank() == 0 and args.eval_data_path.startswith("yt:") \
+                    and not os.path.exists(local_eval_data_path)):
+                yt_pull_dataset(
+                    args.eval_data_path,
+                    local_eval_data_path,
+                    token=args.yt_token,
+                    columns=columns
+                )
+            args.eval_data_path = local_eval_data_path
+
+        print_with_rank(f"Loading evaluation dataset from {args.eval_data_path}...")
+        eval_dataset = multi_load_dataset(args.eval_data_path, columns=columns)
         eval_eagle3_dataset = build_eagle3_dataset(
             eval_dataset,
             tokenizer,
@@ -594,7 +615,7 @@ def main():
         epoch_acces = [[] for _ in range(eagle3_model.module.length)]
         epoch_plosses = [[] for _ in range(eagle3_model.module.length)]
 
-        if dist.get_rank() == 0:
+        if dist.get_rank() == 0 and args.report_to != "print":
             progress_bar = tqdm(
                 train_dataloader, desc=f"Training Epoch {epoch}", leave=True
             )
@@ -605,7 +626,7 @@ def main():
             batch_index += 1
             if args.profile:
                 if batch_index == args.profile_start_step:
-                    print("Start profile")
+                    print_with_rank(f"Start profile")
                     torch_profiler = torch.profiler.profile(
                         activities=[
                             torch.profiler.ProfilerActivity.CPU,
@@ -620,7 +641,7 @@ def main():
                         os.environ["SGLANG_TORCH_PROFILER_DIR"],
                         f"debug_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
                     )
-                    print(f"End profile {output_path=}")
+                    print_with_rank(f"End profile {output_path=}")
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
             if args.profile_memory and batch_index == args.profile_memory_steps:
@@ -653,13 +674,14 @@ def main():
                 / args.draft_accumulation_steps
             )
             ploss.backward()
-            log_dict["train/lr"] = optimizer.get_learning_rate()
             for i in range(len(plosses)):
                 log_dict[f"train/ploss_{i}"] += (
                     plosses[i].item() / args.draft_accumulation_steps
                 )
             for i in range(len(acces)):
                 log_dict[f"train/acc_{i}"] += acces[i] / args.draft_accumulation_steps
+            log_dict["train/epoch"] = epoch + global_step / steps_per_epoch
+            log_dict["train/lr"] = optimizer.get_learning_rate()
             if batch_index % args.draft_accumulation_steps == 0:
                 optimizer.step()
                 global_step += 1
@@ -681,9 +703,12 @@ def main():
             if dist.get_rank() == 0:
                 avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
                 avg_acc = sum(acces) / len(acces)
-                progress_bar.set_postfix(
-                    {"loss": f"{avg_loss:.2f}", "acc": f"{avg_acc:.2f}"}
-                )
+                try:
+                    progress_bar.set_postfix(
+                        {"loss": f"{avg_loss:.2f}", "acc": f"{avg_acc:.2f}"}
+                    )
+                except:
+                    pass
 
             if (
                 args.save_strategy == "steps" and global_step and
@@ -726,7 +751,15 @@ def main():
             eval_acces = [[] for _ in range(eagle3_model.length)]
             eval_plosses = [[] for _ in range(eagle3_model.length)]
 
-            for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
+            if dist.get_rank() == 0 and args.report_to != "print":
+                progress_bar = tqdm(
+                    eval_dataloader, desc=f"Evaluation Epoch {epoch}", leave=True
+                )
+            else:
+                print_on_rank0("Running evaluation...")
+                progress_bar = eval_dataloader
+
+            for data in eval_dataloader:
                 if args.is_vlm:
                     with torch.no_grad():
                         plosses, _, acces = eagle3_model(

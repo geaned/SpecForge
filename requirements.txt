@@ -17,3 +17,4 @@ openai-harmony
 sentencepiece
 tensorboardX
 configargparse
+pandas

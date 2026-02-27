@@ -277,6 +277,28 @@ class MLflowTracker(Tracker):
             self.is_initialized = False
 
 
+class PrintTracker(Tracker):
+    """Tracks experiments using TensorBoard."""
+
+    @classmethod
+    def validate_args(cls, parser, args):
+        pass
+
+    def __init__(self, args, output_dir: str):
+        super().__init__(args, output_dir)
+
+    def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
+        if self.rank == 0:
+            print({
+                k.replace("train/", "").replace("eval/", ""): \
+                    round(v, 4) if not k.endswith("lr") else v
+                for k, v in log_dict.items()
+            })
+
+    def close(self):
+        pass
+
+
 # --- Tracker Factory ---
 TRACKER_REGISTRY = {
     "wandb": WandbTracker,
@@ -284,6 +306,7 @@ TRACKER_REGISTRY = {
     "tensorboard": TensorboardTracker,
     "mlflow": MLflowTracker,
     "none": NoOpTracker,
+    "print": PrintTracker
 }
 
 

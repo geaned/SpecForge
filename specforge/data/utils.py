@@ -18,8 +18,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import torch
 import torch.distributed as dist
 from datasets import Dataset
@@ -266,3 +270,34 @@ def prepare_dp_dataloaders(
         **dataloader_kwargs
     )
     return dataloader
+
+
+def yt_pull_dataset(
+    data_path: str,
+    data_path_out: str,
+    token: str,
+    columns: List[str]
+) -> None:
+    try:
+        import yt.wrapper as yt
+    except:
+        raise ImportError("YT requirements needed to pull dataset from YT")
+
+    if not os.path.exists(data_path_out):
+        proxy, yt_table_path = data_path[3:].split("/", 1)
+        yt_client = yt.YtClient(proxy=proxy, token=token)
+
+        data = {col: [] for col in columns}
+        for row in yt_client.read_table(
+            yt.TablePath(yt_table_path, columns=columns),
+            format=yt.YsonFormat(),
+            enable_read_parallel=True
+        ):
+            for col in columns:
+                v = row[col]
+                # messages and tools should be in string format for compatibility
+                if col in ["messages", "tools"] and isinstance(v, list):
+                    v = json.dumps(v, ensure_ascii=False)
+                data[col].append(v)
+
+        pd.DataFrame.from_dict(data).to_csv(data_path_out, sep='\t', index=False)
