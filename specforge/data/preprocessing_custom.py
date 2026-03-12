@@ -141,29 +141,23 @@ def preprocess_conversations(
             ).input_ids[0]
         else:
             try:
-                conv_dict = json.loads(conv_str)
-                tools_dict = json.loads(tools_str)
-
-                prompt = tokenizer.apply_chat_template(
-                    conversation=conv_dict,
-                    tools=tools_dict,
+                input_ids = tokenizer.apply_chat_template(
+                    conversation=json.loads(conv_str),
+                    tools=json.loads(tools_str),
                     add_generation_prompt=False,
                     truncation=True,
                     max_length=max_length,
                     add_special_tokens=False,
-                    tokenize=False
-                )
-
-                if "yagpt" in chat_template:
-                    yagpt_assistant, yagpt_sep_token = "Ассистент:", "[SEP]"
-                    insert_pos = prompt.rfind(yagpt_assistant) \
-                        + len(yagpt_assistant)
-                    prompt = prompt[:insert_pos] + yagpt_sep_token \
-                        + prompt[insert_pos:]
-                
-                input_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
+                    return_tensors="pt"
+                )[0]
             except Exception as e:
-                print(f"Failed to parse row '{reqid}' during preprocessing")
+                # For easier debugging, dataset building can be launched with a single worker
+                print(
+                    f"Failed to preprocess row {reqid}"
+                    f"\nconv_str: {conv_str}"
+                    f"\ntools_str: {tools_str}"
+                    f"\nreqid: {reqid}"
+                )
                 raise e
 
         start_seq = tokenizer(chat_template_inst.assistant_header).input_ids
@@ -228,8 +222,10 @@ def build_eagle3_dataset(
 
     def preprocess_function(examples):
         extra_kwargs = {}
-        if "request_id" in extra_kwargs:
-            extra_kwargs["reqids"] = examples["request_ids"]
+        if "tools" in examples and not is_preformatted:
+            extra_kwargs["tools"] = examples["tools"]
+        if "request_id" in examples:
+            extra_kwargs["reqids"] = examples["request_id"]
 
         if is_preformatted:
             # Handle pre-formatted text (should be in "text" column)
@@ -254,7 +250,6 @@ def build_eagle3_dataset(
             processed = preprocess_conversations(
                 tokenizer=tokenizer,
                 conversations=examples["messages"],
-                tools=examples["tools"],
                 chat_template=chat_template,
                 max_length=max_length,
                 is_preformatted=False,

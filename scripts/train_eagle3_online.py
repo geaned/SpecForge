@@ -290,9 +290,11 @@ def parse_args():
     return parser, args
 
 
-def main():
+def main(args=None):
     # initialize
-    parser, args = parse_args()
+    parser = None
+    if args is None:
+        parser, args = parse_args()
     set_seed(args.seed)
     if os.environ.get("SGLANG_TORCH_PROFILER_DIR", "") and args.profile_memory:
         torch.cuda.memory._record_memory_history(max_entries=1_000_000)
@@ -312,10 +314,11 @@ def main():
     )
 
     tracker_class = get_tracker_class(args.report_to)
-    if tracker_class:
-        tracker_class.validate_args(parser, args)
-    else:
-        parser.error(f"Unknown tracker: {args.report_to}")
+    if parser:
+        if tracker_class:
+            tracker_class.validate_args(parser, args)
+        else:
+            parser.error(f"Unknown tracker: {args.report_to}")
 
     tracker = create_tracker(args, args.output_dir)
 
@@ -442,17 +445,17 @@ def main():
 
     columns = ["request_id", "messages", "tools"]
     print_with_rank(f"Loading training dataset from {args.train_data_path}...")
-    with rank_0_priority():
-        Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+    if args.train_data_path.startswith("yt:"):
         local_train_data_path = os.path.join(args.cache_dir, "train_dataset.tsv")
-        if (dist.get_rank() == 0 and args.train_data_path.startswith("yt:") \
-                and not os.path.exists(local_train_data_path)):
-            yt_pull_dataset(
-                args.train_data_path,
-                local_train_data_path,
-                token=args.yt_token,
-                columns=columns
-            )
+        with rank_0_priority():
+            if dist.get_rank() == 0 and not os.path.exists(local_train_data_path):
+                Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+                yt_pull_dataset(
+                    args.train_data_path,
+                    local_train_data_path,
+                    token=args.yt_token,
+                    columns=columns
+                )
         args.train_data_path = local_train_data_path
 
     train_dataset = multi_load_dataset(args.train_data_path, columns=columns)
@@ -485,7 +488,7 @@ def main():
         process_group=get_dp_group(),
         is_vlm=args.is_vlm,
     )
-    print_with_rank("Initialized train dataloader")
+    print_with_rank(f"Initialized train dataloader with {len(train_eagle3_dataset)} samples")
 
     # Calculate total steps if not provided
     if args.total_steps is None:
@@ -504,17 +507,17 @@ def main():
     print_with_rank("Loaded vocab mapping")
 
     if args.eval_data_path is not None:
-        with rank_0_priority():
-            Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+        if args.eval_data_path.startswith("yt:"):
             local_eval_data_path = os.path.join(args.cache_dir, "eval_dataset.tsv")
-            if (dist.get_rank() == 0 and args.eval_data_path.startswith("yt:") \
-                    and not os.path.exists(local_eval_data_path)):
-                yt_pull_dataset(
-                    args.eval_data_path,
-                    local_eval_data_path,
-                    token=args.yt_token,
-                    columns=columns
-                )
+            with rank_0_priority():
+                if (dist.get_rank() == 0 and not os.path.exists(local_eval_data_path)):
+                    Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+                    yt_pull_dataset(
+                        args.eval_data_path,
+                        local_eval_data_path,
+                        token=args.yt_token,
+                        columns=columns
+                    )
             args.eval_data_path = local_eval_data_path
 
         print_with_rank(f"Loading evaluation dataset from {args.eval_data_path}...")
@@ -537,7 +540,7 @@ def main():
             process_group=get_dp_group(),
             is_vlm=args.is_vlm,
         )
-        print_with_rank("Initialized eval dataloader")
+        print_with_rank(f"Initialized eval dataloader with {len(eval_eagle3_dataset)} samples")
 
     # build Eagle3 model
     # broadcast draft model
