@@ -14,7 +14,7 @@ torchrun \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3_online.py \
     --target-model-path $MODEL_PATH \
-    --draft-model-config $ROOT_DIR/configs/yagpt-eagle3-202512.json \
+    --draft-model-config $ROOT_DIR/configs/alice-ai-eagle3-202512.json \
     --train-data-path $DATASET_PATH \
     --output-dir $ROOT_DIR/yandexgpt-eagle \
     --num-epochs 1 \
@@ -22,7 +22,7 @@ torchrun \
     --draft-micro-batch-size 1 \
     --learning-rate 5e-5 \
     --warmup-ratio 5e-3 \
-    --max-length 10240 \
+    --max-length 20480 \
     --chat-template yagpt_custom \
     --cache-dir $ROOT_DIR/cache \
     --embedding-key model.embed_tokens.weight \
