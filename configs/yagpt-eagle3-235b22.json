@@ -30,7 +30,7 @@
   "sliding_window": null,
   "tie_word_embeddings": false,
   "torch_dtype": "bfloat16",
-  "transformers_version": "4.43.1",
+  "transformers_version": "4.55.2",
   "use_cache": true,
   "use_sliding_window": false,
   "vocab_size": 129024,

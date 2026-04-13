@@ -30,7 +30,7 @@ torchrun \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3_offline.py \
     --target-model-path $MODEL_PATH \
-    --draft-model-config $ROOT_DIR/configs/yagpt-eagle3.json \
+    --draft-model-config $ROOT_DIR/configs/yagpt-eagle3-32b.json \
     --train-data-path $DATASET_PATH \
     --train-hidden-states-path $HIDDEN_STATES_DIR \
     --output-dir /home/geaned/yagpt-eagle \

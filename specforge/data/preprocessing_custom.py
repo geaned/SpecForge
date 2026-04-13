@@ -114,7 +114,7 @@ def preprocess_conversations(
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
 
-    tools = kwargs.pop("tools", [[]]*len(conversations))
+    tools = kwargs.pop("tools", ["[]"]*len(conversations))
     reqids = kwargs.pop("reqids", [""]*len(conversations))
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
