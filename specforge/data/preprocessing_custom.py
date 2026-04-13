@@ -47,9 +47,9 @@ def build_loss_mask(
 
     # Detect Sequence: The mask should turn ON at the token *after* the token sequence.
     # We pad len(seq) positions to the left (and 0 to right) to shift the trigger forward.
-    def get_triggers(input_ids: torch.Tensor, seq: Optional[List[int]]):
+    def get_triggers(input_ids: torch.Tensor, seq: Optional[List[int]]) -> torch.Tensor:
         if seq is None:
-            return torch.zeros_like(input_ids, dtype=torch.bool)
+            return torch.tensor([], dtype=torch.long)
 
         triggers = torch.ones(len(input_ids) - len(seq), dtype=torch.bool)
         for idx, tok in enumerate(seq):
@@ -66,12 +66,9 @@ def build_loss_mask(
     end_triggers = get_triggers(input_ids, end_seq)
 
     # 2. Match End Trigger Sequencez Whenever Possible
-    if any(end_triggers):
-        end_insertion_indices = torch.searchsorted(end_triggers, start_triggers)
-        valid_mask = end_insertion_indices < len(end_triggers)
-        matched_end_triggers = end_triggers[end_insertion_indices[valid_mask]]
-    else:
-        matched_end_triggers = torch.zeros_like(input_ids, dtype=torch.bool)
+    end_insertion_indices = torch.searchsorted(end_triggers, start_triggers)
+    valid_mask = end_insertion_indices < len(end_triggers)
+    matched_end_triggers = end_triggers[end_insertion_indices[valid_mask]]
 
     # 3. Update the Delta Tensor
     # Add +1 at start positions and subtract -1 at matched end positions

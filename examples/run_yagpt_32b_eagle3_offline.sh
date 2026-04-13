@@ -6,9 +6,9 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 # train eagle3 for yagpt
 NUM_GPUS=${1:-8}
-MODEL_PATH=
-DATASET_PATH=
-HIDDEN_STATES_DIR=
+MODEL_PATH=/home/geaned/models/hf/yandexgpt-5.1-32b-202512
+DATASET_PATH=/home/geaned/scripts/train.tsv
+# HIDDEN_STATES_DIR=
 
 torchrun \
     --standalone \
