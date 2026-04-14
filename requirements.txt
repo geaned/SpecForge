@@ -1,9 +1,9 @@
 pre-commit
-torch==2.8.0
-torchaudio==2.8.0
-torchvision==0.23.0
-transformers==4.55.2
-qwen-vl-utils==0.0.11
+torch==2.9.1
+torchaudio==2.9.1
+torchvision==0.24.1
+transformers==4.57.1
+qwen-vl-utils
 datasets
 setuptools
 tqdm
@@ -12,9 +12,13 @@ psutil
 numpy
 accelerate
 pydantic
-sglang[all]==0.5.1
+# sglang[all]==0.5.9  # should be installed within the sglang container
 openai-harmony
 sentencepiece
 tensorboardX
 configargparse
 pandas
+tensorboard
+yandex-snooper @ https://pypi.yandex-team.ru/repo/default/download/yandex-snooper/1801398/yandex_snooper-1.0.18084659-cp36-abi3-linux_x86_64.whl#md5=05f16ca2858c505abd059c811a91ac3d
+yandex-yt @ https://pypi.yandex-team.ru/repo/default/download/yandex-yt/1535388/yandex_yt-0.15.1-py3-none-any.whl#md5=254d3eaace49ce94951123e082a6d5f8
+yandex-yt-yson-bindings @ https://pypi.yandex-team.ru/repo/default/download/yandex-yt-yson-bindings/1560307/yandex_yt_yson_bindings-0.4.9.post0-cp34-abi3-linux_x86_64.whl#md5=7321c2500f9f41534aad2b164d738c22

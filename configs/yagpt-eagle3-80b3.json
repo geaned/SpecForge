@@ -33,7 +33,7 @@
   "rope_theta": 10000000,
   "sliding_window": null,
   "tie_word_embeddings": false,
-  "transformers_version": "4.57.3",
+  "transformers_version": "4.57.1",
   "use_cache": true,
   "use_sliding_window": false,
   "vocab_size": 129024

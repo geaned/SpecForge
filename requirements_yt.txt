@@ -1,4 +1,0 @@
---index-url https://pypi.yandex-team.ru/simple
-yandex-yt
-yandex-yt-driver-rpc-bindings
-yandex-yt-yson-bindings
